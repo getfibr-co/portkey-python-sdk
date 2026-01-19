@@ -80,6 +80,11 @@ class _TextChunk:
         self.text = text
 
 
+class _ThoughtChunk:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
 class _UsageMetadataChunk:
     def __init__(
         self, prompt_tokens: int, completion_tokens: int, total_tokens: int
@@ -126,15 +131,24 @@ def _get_content(parts: Iterable[Any]) -> Union[list[dict], str]:
             data_uri = f"data:{inline_data.mime_type};base64,{b64}"
             if inline_data.mime_type.startswith("image"):
                 content_objects.append(
-                    {"type": "image_url", "image_url": {"url": data_uri}}
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_uri},
+                    }
                 )
             elif inline_data.mime_type.startswith("video"):
                 content_objects.append(
-                    {"type": "video_url", "video_url": {"url": data_uri}}
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": data_uri},
+                    }
                 )
             elif inline_data.mime_type.startswith("audio"):
                 content_objects.append(
-                    {"type": "audio_url", "audio_url": {"url": data_uri}}
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": data_uri},
+                    }
                 )
             elif inline_data.mime_type == "application/pdf":
                 content_objects.append(
@@ -281,7 +295,8 @@ def _model_response_to_chunk(
     response: Any,
 ) -> Generator[
     Tuple[
-        Optional[Union[_TextChunk, _FunctionChunk, _UsageMetadataChunk]], Optional[str]
+        Optional[Union[_TextChunk, _FunctionChunk, _UsageMetadataChunk, _ThoughtChunk]],
+        Optional[str],
     ],
     None,
     None,
@@ -298,6 +313,10 @@ def _model_response_to_chunk(
             message = choice0.message
 
         if message:
+            reasoning_content = getattr(message, "reasoning_content", None)
+            if reasoning_content:
+                yield _ThoughtChunk(text=reasoning_content), finish_reason
+
             if getattr(message, "content", None):
                 yield _TextChunk(text=message.content), finish_reason
 
@@ -305,20 +324,26 @@ def _model_response_to_chunk(
             if tool_calls:
                 for tool_call in tool_calls:
                     if getattr(tool_call, "type", None) == "function":
-                        yield _FunctionChunk(
-                            id=getattr(tool_call, "id", None),
-                            name=getattr(
-                                getattr(tool_call, "function", None), "name", None
+                        yield (
+                            _FunctionChunk(
+                                id=getattr(tool_call, "id", None),
+                                name=getattr(
+                                    getattr(tool_call, "function", None), "name", None
+                                ),
+                                args=getattr(
+                                    getattr(tool_call, "function", None),
+                                    "arguments",
+                                    None,
+                                ),
+                                index=getattr(tool_call, "index", 0),
                             ),
-                            args=getattr(
-                                getattr(tool_call, "function", None), "arguments", None
-                            ),
-                            index=getattr(tool_call, "index", 0),
-                        ), finish_reason
+                            finish_reason,
+                        )
 
             if finish_reason and not (
                 (getattr(message, "content", None))
                 or (getattr(message, "tool_calls", None))
+                or reasoning_content
             ):
                 yield None, finish_reason
 
@@ -327,19 +352,31 @@ def _model_response_to_chunk(
 
     usage = getattr(response, "usage", None)
     if usage:
-        yield _UsageMetadataChunk(
-            prompt_tokens=getattr(usage, "prompt_tokens", 0),
-            completion_tokens=getattr(usage, "completion_tokens", 0),
-            total_tokens=getattr(usage, "total_tokens", 0),
-        ), None
+        yield (
+            _UsageMetadataChunk(
+                prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                completion_tokens=getattr(usage, "completion_tokens", 0),
+                total_tokens=getattr(usage, "total_tokens", 0),
+            ),
+            None,
+        )
 
 
-def _message_to_generate_content_response(message: Any, is_partial: bool = False) -> "LlmResponse":  # type: ignore[name-defined]
+def _message_to_generate_content_response(
+    message: Any, is_partial: bool = False
+) -> "LlmResponse":  # type: ignore[name-defined]
     """Convert a Portkey-style message object to ADK LlmResponse."""
     from google.genai import types as genai_types  # type: ignore
     from google.adk.models.llm_response import LlmResponse  # type: ignore
 
     parts: list[Any] = []
+
+    reasoning_content = getattr(message, "reasoning_content", None)
+    if reasoning_content:
+        thought_part = genai_types.Part.from_text(text=reasoning_content)
+        thought_part.thought = True
+        parts.append(thought_part)
+
     if getattr(message, "content", None):
         parts.append(genai_types.Part.from_text(text=message.content))
 
@@ -353,7 +390,6 @@ def _message_to_generate_content_response(message: Any, is_partial: bool = False
                         or "{}"
                     ),
                 )
-                # Attach tool_call id if present
                 try:
                     part.function_call.id = getattr(tool_call, "id", None)  # type: ignore[union-attr]
                 except Exception:
@@ -449,7 +485,9 @@ def _get_completion_inputs(
 class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
     """ADK `BaseLlm` adapter backed by Portkey Async client."""
 
-    def __init__(self, model: str, api_key: Optional[str] = None, **kwargs: Any) -> None:  # type: ignore[override]
+    def __init__(
+        self, model: str, api_key: Optional[str] = None, **kwargs: Any
+    ) -> None:  # type: ignore[override]
         if not _HAS_ADK:
             raise ImportError(
                 "google-adk is not installed. Install with: pip install 'portkey-ai[adk]'"
@@ -461,7 +499,9 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
             sys_role if sys_role in ("developer", "system") else "developer"
         )
 
-        super().__init__(model=model, **{k: v for k, v in kwargs.items() if k != "model"})  # type: ignore[misc]
+        super().__init__(
+            model=model, **{k: v for k, v in kwargs.items() if k != "model"}
+        )  # type: ignore[misc]
 
         # Set up Portkey client
         client_args: dict[str, Any] = {}
@@ -488,7 +528,9 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
         self._additional_args.pop("tools", None)
         self._additional_args.pop("stream", None)
 
-    async def generate_content_async(self, llm_request: "LlmRequest", stream: bool = False) -> AsyncGenerator["LlmResponse", None]:  # type: ignore[override,name-defined]
+    async def generate_content_async(
+        self, llm_request: "LlmRequest", stream: bool = False
+    ) -> AsyncGenerator["LlmResponse", None]:  # type: ignore[override,name-defined]
         """Generate ADK LlmResponse objects using Portkey Chat Completions."""
         # Use ADK BaseLlm helper to ensure a user message exists so model can respond
         self._maybe_append_user_content(llm_request)
@@ -510,16 +552,17 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
             completion_args["tool_choice"] = "auto"
 
         if stream:
-            # Aggregate streaming text and tool calls to yield ADK LlmResponse objects
             text_accum = ""
+            thought_accum = ""
             function_calls: dict[int, dict[str, Any]] = {}
             fallback_index = 0
             usage_metadata = None
             aggregated_llm_response = None
             aggregated_llm_response_with_tool_call = None
 
-            # Await the creation to obtain an async iterator for streaming
-            stream_obj = await self._client.chat.completions.create(stream=True, **completion_args)  # type: ignore[arg-type]
+            stream_obj = await self._client.chat.completions.create(
+                stream=True, **completion_args
+            )  # type: ignore[arg-type]
             stream_iter = cast(AsyncIterator[Any], stream_obj)
             async for part in stream_iter:
                 for chunk, finish_reason in _model_response_to_chunk(part):
@@ -531,7 +574,6 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                             function_calls[idx]["name"] += chunk.name
                         if chunk.args:
                             function_calls[idx]["args"] += chunk.args
-                            # If args parses as JSON, advance fallback index (handles providers that omit indices)
                             try:
                                 json.loads(function_calls[idx]["args"])
                                 fallback_index += 1
@@ -540,12 +582,31 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                         function_calls[idx]["id"] = (
                             chunk.id or function_calls[idx]["id"] or str(idx)
                         )
-                    elif isinstance(chunk, _TextChunk):
-                        text_accum += chunk.text
-                        # Yield partials for better interactivity
+                    elif isinstance(chunk, _ThoughtChunk):
+                        thought_accum += chunk.text
                         yield _message_to_generate_content_response(
                             type(
-                                "Msg", (), {"content": chunk.text, "tool_calls": None}
+                                "Msg",
+                                (),
+                                {
+                                    "content": None,
+                                    "reasoning_content": chunk.text,
+                                    "tool_calls": None,
+                                },
+                            )(),
+                            is_partial=True,
+                        )
+                    elif isinstance(chunk, _TextChunk):
+                        text_accum += chunk.text
+                        yield _message_to_generate_content_response(
+                            type(
+                                "Msg",
+                                (),
+                                {
+                                    "content": chunk.text,
+                                    "reasoning_content": None,
+                                    "tool_calls": None,
+                                },
                             )(),
                             is_partial=True,
                         )
@@ -561,7 +622,6 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                         )
 
                     if (finish_reason in ("tool_calls", "stop")) and function_calls:
-                        # Flush tool calls as a single LlmResponse
                         tool_calls = []
                         for idx, data in function_calls.items():
                             if data.get("id"):
@@ -587,20 +647,32 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                         aggregated_llm_response_with_tool_call = (
                             _message_to_generate_content_response(
                                 type(
-                                    "Msg", (), {"content": "", "tool_calls": tool_calls}
+                                    "Msg",
+                                    (),
+                                    {
+                                        "content": "",
+                                        "reasoning_content": thought_accum or None,
+                                        "tool_calls": tool_calls,
+                                    },
                                 )()
                             )
                         )
                         function_calls.clear()
-                    elif finish_reason == "stop" and text_accum:
+                    elif finish_reason == "stop" and (text_accum or thought_accum):
                         aggregated_llm_response = _message_to_generate_content_response(
                             type(
-                                "Msg", (), {"content": text_accum, "tool_calls": None}
+                                "Msg",
+                                (),
+                                {
+                                    "content": text_accum or None,
+                                    "reasoning_content": thought_accum or None,
+                                    "tool_calls": None,
+                                },
                             )()
                         )
                         text_accum = ""
+                        thought_accum = ""
 
-            # End of stream: yield aggregated responses (attach usage if available)
             if aggregated_llm_response:
                 if usage_metadata is not None:
                     aggregated_llm_response.usage_metadata = usage_metadata
