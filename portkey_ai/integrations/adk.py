@@ -76,13 +76,15 @@ class _FunctionChunk:
 
 
 class _TextChunk:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, thought_signature: Optional[str] = None) -> None:
         self.text = text
+        self.thought_signature = thought_signature
 
 
 class _ThoughtChunk:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, thought_signature: Optional[str] = None) -> None:
         self.text = text
+        self.thought_signature = thought_signature
 
 
 class _UsageMetadataChunk:
@@ -92,6 +94,53 @@ class _UsageMetadataChunk:
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.total_tokens = total_tokens
+
+
+def _get_anthropic_content_blocks(message: Any) -> Optional[list[dict[str, Any]]]:
+    content_blocks = getattr(message, "content_blocks", None)
+    if content_blocks is None:
+        content = getattr(message, "content", None)
+        if isinstance(content, list):
+            content_blocks = content
+    return content_blocks
+
+
+def _iter_anthropic_content_blocks(
+    content_blocks: Optional[list[dict[str, Any]]],
+) -> Iterable[tuple[str, str, Optional[str]]]:
+    if not content_blocks:
+        return []
+    items: list[tuple[str, str, Optional[str]]] = []
+    for block in content_blocks:
+        block_type = block.get("type")
+        thought_signature = _get_gemini_thought_signature(
+            block.get("thought_signature")
+        )
+        if block_type == "thinking":
+            text = block.get("thinking")
+            if text:
+                items.append(("thinking", text, thought_signature))
+        elif block_type == "text":
+            text = block.get("text")
+            if text:
+                items.append(("text", text, thought_signature))
+        elif "delta" in block:
+            delta = block.get("delta", {})
+            if delta.get("thinking"):
+                items.append(("thinking", delta["thinking"], thought_signature))
+            elif delta.get("text"):
+                items.append(("text", delta["text"], thought_signature))
+    return items
+
+
+def _get_gemini_thought_signature(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("utf-8")
+    if isinstance(value, str):
+        return value
+    return None
 
 
 def _safe_json_serialize(obj: Any) -> str:
@@ -117,11 +166,17 @@ def _get_content(parts: Iterable[Any]) -> Union[list[dict], str]:
     for part in parts:
         text = getattr(part, "text", None)
         inline_data = getattr(part, "inline_data", None)
+        thought_signature = _get_gemini_thought_signature(
+            getattr(part, "thought_signature", None)
+        )
         if text:
             # Return simple string when it's a single text part
             if isinstance(parts, list) and len(parts) == 1:
                 return text
-            content_objects.append({"type": "text", "text": text})
+            content_object: dict[str, Any] = {"type": "text", "text": text}
+            if thought_signature:
+                content_object["thought_signature"] = thought_signature
+            content_objects.append(content_object)
         elif (
             inline_data
             and getattr(inline_data, "data", None)
@@ -195,18 +250,22 @@ def _content_to_message_param(content: Any) -> Union[dict, list[dict]]:
     for part in getattr(content, "parts", []) or []:
         function_call = getattr(part, "function_call", None)
         if function_call:
-            tool_calls.append(
-                {
-                    "type": "function",
-                    "id": getattr(function_call, "id", None),
-                    "function": {
-                        "name": getattr(function_call, "name", None),
-                        "arguments": _safe_json_serialize(
-                            getattr(function_call, "args", None)
-                        ),
-                    },
-                }
+            tool_call: dict[str, Any] = {
+                "type": "function",
+                "id": getattr(function_call, "id", None),
+                "function": {
+                    "name": getattr(function_call, "name", None),
+                    "arguments": _safe_json_serialize(
+                        getattr(function_call, "args", None)
+                    ),
+                },
+            }
+            thought_signature = _get_gemini_thought_signature(
+                getattr(part, "thought_signature", None)
             )
+            if thought_signature:
+                tool_call["thought_signature"] = thought_signature
+            tool_calls.append(tool_call)
         elif getattr(part, "text", None) or getattr(part, "inline_data", None):
             content_present = True
 
@@ -317,7 +376,23 @@ def _model_response_to_chunk(
             if reasoning_content:
                 yield _ThoughtChunk(text=reasoning_content), finish_reason
 
-            if getattr(message, "content", None):
+            content_blocks = _get_anthropic_content_blocks(message)
+            has_content_blocks = bool(content_blocks)
+            for block_type, text, thought_signature in _iter_anthropic_content_blocks(
+                content_blocks
+            ):
+                if block_type == "thinking":
+                    yield (
+                        _ThoughtChunk(text=text, thought_signature=thought_signature),
+                        finish_reason,
+                    )
+                elif block_type == "text":
+                    yield (
+                        _TextChunk(text=text, thought_signature=thought_signature),
+                        finish_reason,
+                    )
+
+            if not has_content_blocks and getattr(message, "content", None):
                 yield _TextChunk(text=message.content), finish_reason
 
             tool_calls = getattr(message, "tool_calls", None)
@@ -344,6 +419,7 @@ def _model_response_to_chunk(
                 (getattr(message, "content", None))
                 or (getattr(message, "tool_calls", None))
                 or reasoning_content
+                or has_content_blocks
             ):
                 yield None, finish_reason
 
@@ -371,14 +447,30 @@ def _message_to_generate_content_response(
 
     parts: list[Any] = []
 
-    reasoning_content = getattr(message, "reasoning_content", None)
-    if reasoning_content:
-        thought_part = genai_types.Part.from_text(text=reasoning_content)
-        thought_part.thought = True
-        parts.append(thought_part)
-
-    if getattr(message, "content", None):
-        parts.append(genai_types.Part.from_text(text=message.content))
+    content_blocks = _get_anthropic_content_blocks(message)
+    if content_blocks:
+        for block_type, text, thought_signature in _iter_anthropic_content_blocks(
+            content_blocks
+        ):
+            if block_type == "thinking":
+                thought_part = genai_types.Part.from_text(text=text)
+                thought_part.thought = True
+                if thought_signature:
+                    thought_part.thought_signature = thought_signature
+                parts.append(thought_part)
+            elif block_type == "text":
+                text_part = genai_types.Part.from_text(text=text)
+                if thought_signature:
+                    text_part.thought_signature = thought_signature
+                parts.append(text_part)
+    else:
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content:
+            thought_part = genai_types.Part.from_text(text=reasoning_content)
+            thought_part.thought = True
+            parts.append(thought_part)
+        if getattr(message, "content", None):
+            parts.append(genai_types.Part.from_text(text=message.content))
 
     if getattr(message, "tool_calls", None):
         for tool_call in message.tool_calls:
@@ -479,6 +571,21 @@ def _get_completion_inputs(
     return messages, tools, response_format
 
 
+def _get_thinking_config(llm_request: "LlmRequest") -> Optional[dict[str, Any]]:  # type: ignore[name-defined]
+    config = getattr(llm_request, "config", None)
+    thinking_config = getattr(config, "thinking_config", None) if config else None
+    if not thinking_config:
+        return None
+    include_thoughts = getattr(thinking_config, "include_thoughts", None)
+    thinking_budget = getattr(thinking_config, "thinking_budget", None)
+    if not include_thoughts and not thinking_budget:
+        return None
+    result: dict[str, Any] = {"type": "enabled"}
+    if thinking_budget:
+        result["budget_tokens"] = thinking_budget
+    return result
+
+
 # ----------------------------- main adapter ---------------------------------
 
 
@@ -518,6 +625,9 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
             client_args["provider"] = kwargs.pop("provider")
         if "Authorization" in kwargs:
             client_args["Authorization"] = kwargs.pop("Authorization")
+        client_args["strict_open_ai_compliance"] = kwargs.pop(
+            "strict_open_ai_compliance", False
+        )
 
         self._client = AsyncPortkey(**client_args)  # type: ignore[arg-type]
 
@@ -538,6 +648,7 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
         messages, tools, response_format = _get_completion_inputs(
             llm_request, getattr(self, "_system_role", "developer")
         )
+        thinking_config = _get_thinking_config(llm_request)
 
         completion_args: dict[str, Any] = {
             "model": getattr(self, "model", None),
@@ -546,6 +657,8 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
             # Only include response_format if we successfully converted it
             **({"response_format": response_format} if response_format else {}),
         }
+        if thinking_config:
+            completion_args["thinking"] = thinking_config
         completion_args.update(self._additional_args)
         if tools and "tool_choice" not in completion_args:
             # Encourage tool use when functions are provided, mirroring Strands behavior
@@ -554,6 +667,8 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
         if stream:
             text_accum = ""
             thought_accum = ""
+            text_signature = None
+            thought_signature = None
             function_calls: dict[int, dict[str, Any]] = {}
             fallback_index = 0
             usage_metadata = None
@@ -584,6 +699,8 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                         )
                     elif isinstance(chunk, _ThoughtChunk):
                         thought_accum += chunk.text
+                        if chunk.thought_signature:
+                            thought_signature = chunk.thought_signature
                         yield _message_to_generate_content_response(
                             type(
                                 "Msg",
@@ -591,6 +708,13 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                                 {
                                     "content": None,
                                     "reasoning_content": chunk.text,
+                                    "content_blocks": [
+                                        {
+                                            "type": "thinking",
+                                            "thinking": chunk.text,
+                                            "thought_signature": chunk.thought_signature,
+                                        }
+                                    ],
                                     "tool_calls": None,
                                 },
                             )(),
@@ -598,6 +722,8 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                         )
                     elif isinstance(chunk, _TextChunk):
                         text_accum += chunk.text
+                        if chunk.thought_signature:
+                            text_signature = chunk.thought_signature
                         yield _message_to_generate_content_response(
                             type(
                                 "Msg",
@@ -605,6 +731,13 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                                 {
                                     "content": chunk.text,
                                     "reasoning_content": None,
+                                    "content_blocks": [
+                                        {
+                                            "type": "text",
+                                            "text": chunk.text,
+                                            "thought_signature": chunk.thought_signature,
+                                        }
+                                    ],
                                     "tool_calls": None,
                                 },
                             )(),
@@ -652,6 +785,20 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                                     {
                                         "content": "",
                                         "reasoning_content": thought_accum or None,
+                                        "content_blocks": [
+                                            {
+                                                "type": "thinking",
+                                                "thinking": thought_accum,
+                                                "thought_signature": thought_signature,
+                                            },
+                                            {
+                                                "type": "text",
+                                                "text": "",
+                                                "thought_signature": text_signature,
+                                            },
+                                        ]
+                                        if (thought_accum or text_accum)
+                                        else None,
                                         "tool_calls": tool_calls,
                                     },
                                 )()
@@ -666,12 +813,28 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                                 {
                                     "content": text_accum or None,
                                     "reasoning_content": thought_accum or None,
+                                    "content_blocks": [
+                                        {
+                                            "type": "thinking",
+                                            "thinking": thought_accum,
+                                            "thought_signature": thought_signature,
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": text_accum,
+                                            "thought_signature": text_signature,
+                                        },
+                                    ]
+                                    if (thought_accum or text_accum)
+                                    else None,
                                     "tool_calls": None,
                                 },
                             )()
                         )
                         text_accum = ""
                         thought_accum = ""
+                        text_signature = None
+                        thought_signature = None
 
             if aggregated_llm_response:
                 if usage_metadata is not None:
