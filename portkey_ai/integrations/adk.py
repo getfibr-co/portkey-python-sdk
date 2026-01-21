@@ -578,7 +578,7 @@ def _get_thinking_config(llm_request: "LlmRequest") -> Optional[dict[str, Any]]:
         return None
     include_thoughts = getattr(thinking_config, "include_thoughts", None)
     thinking_budget = getattr(thinking_config, "thinking_budget", None)
-    if not include_thoughts and not thinking_budget:
+    if not include_thoughts:
         return None
     result: dict[str, Any] = {"type": "enabled"}
     if thinking_budget:
