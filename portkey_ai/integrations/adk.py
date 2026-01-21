@@ -76,12 +76,16 @@ class _FunctionChunk:
 
 
 class _TextChunk:
+    """Text content chunk with optional thought signature for verification."""
+
     def __init__(self, text: str, thought_signature: Optional[str] = None) -> None:
         self.text = text
         self.thought_signature = thought_signature
 
 
 class _ThoughtChunk:
+    """Reasoning/thinking content chunk with optional signature for verification."""
+
     def __init__(self, text: str, thought_signature: Optional[str] = None) -> None:
         self.text = text
         self.thought_signature = thought_signature
@@ -97,6 +101,7 @@ class _UsageMetadataChunk:
 
 
 def _get_anthropic_content_blocks(message: Any) -> Optional[list[dict[str, Any]]]:
+    """Extract content blocks from Anthropic-style responses which structure thinking/text separately."""
     content_blocks = getattr(message, "content_blocks", None)
     if content_blocks is None:
         content = getattr(message, "content", None)
@@ -108,6 +113,7 @@ def _get_anthropic_content_blocks(message: Any) -> Optional[list[dict[str, Any]]
 def _iter_anthropic_content_blocks(
     content_blocks: Optional[list[dict[str, Any]]],
 ) -> Iterable[tuple[str, str, Optional[str]]]:
+    """Iterate content blocks handling both complete blocks and streaming deltas uniformly."""
     if not content_blocks:
         return []
     items: list[tuple[str, str, Optional[str]]] = []
@@ -134,6 +140,7 @@ def _iter_anthropic_content_blocks(
 
 
 def _get_gemini_thought_signature(value: Any) -> Optional[str]:
+    """Normalize thought signatures to string format since Gemini may send as bytes."""
     if value is None:
         return None
     if isinstance(value, bytes):
@@ -157,10 +164,7 @@ def _to_portkey_role(role: Optional[str]) -> Literal["user", "assistant"]:
 
 
 def _get_content(parts: Iterable[Any]) -> Union[list[dict], str]:
-    """Convert ADK parts to Portkey/OpenAI-compatible content.
-
-    Note: we import google.genai.types lazily to avoid runtime import when ADK isn't installed.
-    """
+    """Lazily imports google.genai.types to avoid runtime dependency when ADK isn't installed."""
     content_objects: list[dict] = []
     # We treat `parts` as an iterable of objects with attributes: text, inline_data(data,mime_type)
     for part in parts:
@@ -572,6 +576,7 @@ def _get_completion_inputs(
 
 
 def _get_thinking_config(llm_request: "LlmRequest") -> Optional[dict[str, Any]]:  # type: ignore[name-defined]
+    """Extract thinking configuration, making budget optional to support various model capabilities."""
     config = getattr(llm_request, "config", None)
     thinking_config = getattr(config, "thinking_config", None) if config else None
     if not thinking_config:
@@ -625,6 +630,7 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
             client_args["provider"] = kwargs.pop("provider")
         if "Authorization" in kwargs:
             client_args["Authorization"] = kwargs.pop("Authorization")
+        # Default to False to allow extended thinking features beyond OpenAI spec
         client_args["strict_open_ai_compliance"] = kwargs.pop(
             "strict_open_ai_compliance", False
         )
@@ -667,6 +673,7 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
         if stream:
             text_accum = ""
             thought_accum = ""
+            # Track signatures separately since they arrive once per content type, not per chunk
             text_signature = None
             thought_signature = None
             function_calls: dict[int, dict[str, Any]] = {}
@@ -777,32 +784,31 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                                         },
                                     )()
                                 )
-                        aggregated_llm_response_with_tool_call = (
-                            _message_to_generate_content_response(
-                                type(
-                                    "Msg",
-                                    (),
-                                    {
-                                        "content": "",
-                                        "reasoning_content": thought_accum or None,
-                                        "content_blocks": [
-                                            {
-                                                "type": "thinking",
-                                                "thinking": thought_accum,
-                                                "thought_signature": thought_signature,
-                                            },
-                                            {
-                                                "type": "text",
-                                                "text": "",
-                                                "thought_signature": text_signature,
-                                            },
-                                        ]
-                                        if (thought_accum or text_accum)
-                                        else None,
-                                        "tool_calls": tool_calls,
-                                    },
-                                )()
-                            )
+                        aggregated_llm_response_with_tool_call = _message_to_generate_content_response(
+                            type(
+                                "Msg",
+                                (),
+                                {
+                                    "content": "",
+                                    "reasoning_content": thought_accum or None,
+                                    # Include both thinking and text blocks for consistent structure, even if one is empty
+                                    "content_blocks": [
+                                        {
+                                            "type": "thinking",
+                                            "thinking": thought_accum,
+                                            "thought_signature": thought_signature,
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "",
+                                            "thought_signature": text_signature,
+                                        },
+                                    ]
+                                    # Only include content_blocks if we have actual content to avoid empty structures
+                                    if (thought_accum or text_accum) else None,
+                                    "tool_calls": tool_calls,
+                                },
+                            )()
                         )
                         function_calls.clear()
                     elif finish_reason == "stop" and (text_accum or thought_accum):
@@ -831,6 +837,7 @@ class PortkeyAdk(_AdkBaseLlm):  # type: ignore[misc]
                                 },
                             )()
                         )
+                        # Reset for next streaming iteration
                         text_accum = ""
                         thought_accum = ""
                         text_signature = None
